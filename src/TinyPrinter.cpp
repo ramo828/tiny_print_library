@@ -854,160 +854,199 @@ void X5hPrinter::printMatrix(const uint8_t* matrix, int rows, int cols, uint8_t 
 // ============================================================
 // ISO/IEC 18004 STANDARD QR CODE GENERATOR & PAYLOAD HELPERS
 // ============================================================
-
 bool X5hPrinter::generateISO18004QRCode(const char* text, QRErrorCorrection eccLevel, std::vector<uint8_t>& outModules, int& outDimension) {
   if (!text) return false;
 
-  size_t dataLen = strlen(text);
-  if (dataLen == 0 || dataLen > 120) return false;
+  const size_t dataLen = strlen(text);
+  if (dataLen == 0 || dataLen > 80) return false;
 
-  int version = 1;
-  size_t maxDataBytes = 16;
-  size_t eccBytesCount = 10;
+  // ----------------------------------------------------------
+  // 1. Version seçimi (Byte mode, Level M kapasiteleri)
+  // V1: 14 byte, V2: 26 byte, V3: 42 byte, V4: 62 byte (yaklaşık)
+  // ----------------------------------------------------------
+  int version;
+  size_t dataCodewords, eccCodewords;
 
-  if (dataLen <= 14) { version = 1; maxDataBytes = 16; eccBytesCount = 10; }
-  else if (dataLen <= 26) { version = 2; maxDataBytes = 28; eccBytesCount = 16; }
-  else { version = 3; maxDataBytes = 44; eccBytesCount = 26; }
+  if (dataLen <= 14) {
+    version = 1; dataCodewords = 16; eccCodewords = 10;   // total 26
+  } else if (dataLen <= 26) {
+    version = 2; dataCodewords = 28; eccCodewords = 16;   // total 44
+  } else if (dataLen <= 42) {
+    version = 3; dataCodewords = 44; eccCodewords = 26;   // total 70
+  } else {
+    version = 4; dataCodewords = 64; eccCodewords = 36;   // total 100
+  }
 
-  int dimension = 17 + version * 4;
-  outDimension = dimension;
+  const int dimension = 17 + version * 4;   // 21, 25, 29, 33
 
-  std::vector<uint8_t> dataBytes(maxDataBytes, 0);
+  // ----------------------------------------------------------
+  // 2. Bit buffer ile doğru Byte Mode encoding
+  // ----------------------------------------------------------
+  std::vector<uint8_t> dataBytes(dataCodewords, 0);
+  int bitCount = 0;
 
-  // Byte mode header (0x4) + length
-  dataBytes[0] = 0x40 | ((dataLen >> 4) & 0x0F);
-  dataBytes[1] = ((dataLen & 0x0F) << 4);
-
-  for (size_t i = 0; i < dataLen; i++) {
-    uint8_t b = (uint8_t)text[i];
-    dataBytes[1 + i] |= (b >> 4);
-    if (2 + i < maxDataBytes) {
-      dataBytes[2 + i] = (b & 0x0F) << 4;
+  auto putBits = [&](uint32_t val, int nbits) {
+    for (int i = nbits - 1; i >= 0; --i) {
+      if (bitCount >= (int)dataCodewords * 8) return;
+      if (val & (1u << i)) {
+        dataBytes[bitCount >> 3] |= (uint8_t)(1 << (7 - (bitCount & 7)));
+      }
+      ++bitCount;
     }
-  }
-
-  // Pad remaining bytes with 0xEC and 0x11
-  static const uint8_t padPatterns[2] = { 0xEC, 0x11 };
-  size_t writtenDataBytes = 2 + dataLen;
-  for (size_t p = writtenDataBytes; p < maxDataBytes; p++) {
-    dataBytes[p] = padPatterns[(p - writtenDataBytes) % 2];
-  }
-
-  std::vector<uint8_t> eccBytes(eccBytesCount, 0);
-  encodeReedSolomonECC(dataBytes.data(), maxDataBytes, eccBytes.data(), eccBytesCount);
-
-  std::vector<uint8_t> finalCodewords;
-  finalCodewords.insert(finalCodewords.end(), dataBytes.begin(), dataBytes.end());
-  finalCodewords.insert(finalCodewords.end(), eccBytes.begin(), eccBytes.end());
-
-  int quietZone = 4;
-  int totalDim = dimension + quietZone * 2;
-  outModules.assign(totalDim * totalDim, 0);
-
-  std::vector<uint8_t> isReserved(totalDim * totalDim, 0);
-
-  auto setModule = [&](int r, int c, bool val, bool reserved = true) {
-    int gr = r + quietZone;
-    int gc = c + quietZone;
-    outModules[gr * totalDim + gc] = val ? 1 : 0;
-    if (reserved) isReserved[gr * totalDim + gc] = 1;
   };
 
-  // 1. Finder patterns
-  auto drawFinder = [&](int startR, int startC) {
-    for (int r = -1; r <= 7; r++) {
-      for (int c = -1; c <= 7; c++) {
-        int mr = startR + r;
-        int mc = startC + c;
-        if (mr >= 0 && mr < dimension && mc >= 0 && mc < dimension) {
-          bool black = (r >= 0 && r <= 6 && c >= 0 && c <= 6) &&
-                       (r == 0 || r == 6 || c == 0 || c == 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4));
-          setModule(mr, mc, black, true);
+  putBits(0b0100, 4);                 // Mode = Byte
+  putBits((uint32_t)dataLen, 8);      // Character count (V1-9)
+
+  for (size_t i = 0; i < dataLen; ++i)
+    putBits((uint8_t)text[i], 8);
+
+  // Terminator (max 4 zero bits)
+  int rem = (int)dataCodewords * 8 - bitCount;
+  if (rem > 4) rem = 4;
+  if (rem > 0) putBits(0, rem);
+
+  // Byte hizalama
+  while (bitCount & 7) putBits(0, 1);
+
+  // Pad 0xEC / 0x11
+  bool padEC = true;
+  while ((bitCount >> 3) < (int)dataCodewords) {
+    putBits(padEC ? 0xEC : 0x11, 8);
+    padEC = !padEC;
+  }
+
+  // ----------------------------------------------------------
+  // 3. Reed-Solomon
+  // ----------------------------------------------------------
+  std::vector<uint8_t> eccBytes(eccCodewords, 0);
+  encodeReedSolomonECC(dataBytes.data(), dataCodewords, eccBytes.data(), eccCodewords);
+
+  std::vector<uint8_t> codewords;
+  codewords.reserve(dataCodewords + eccCodewords);
+  codewords.insert(codewords.end(), dataBytes.begin(), dataBytes.end());
+  codewords.insert(codewords.end(), eccBytes.begin(), eccBytes.end());
+
+  // ----------------------------------------------------------
+  // 4. Matrix + Quiet Zone
+  // ----------------------------------------------------------
+  const int quiet = 4;
+  const int size  = dimension + quiet * 2;
+  outModules.assign(size * size, 0);
+  std::vector<uint8_t> reserved(size * size, 0);
+
+  auto set = [&](int r, int c, bool black, bool res = true) {
+    if (r < 0 || r >= dimension || c < 0 || c >= dimension) return;
+    int gr = r + quiet, gc = c + quiet;
+    outModules[gr * size + gc] = black ? 1 : 0;
+    if (res) reserved[gr * size + gc] = 1;
+  };
+
+  // Finder + separator
+  auto finder = [&](int tr, int tc) {
+    for (int r = -1; r <= 7; ++r) {
+      for (int c = -1; c <= 7; ++c) {
+        int mr = tr + r, mc = tc + c;
+        if (mr < 0 || mr >= dimension || mc < 0 || mc >= dimension) continue;
+        bool black = false;
+        if (r >= 0 && r <= 6 && c >= 0 && c <= 6) {
+          black = (r == 0 || r == 6 || c == 0 || c == 6 ||
+                   (r >= 2 && r <= 4 && c >= 2 && c <= 4));
         }
+        set(mr, mc, black, true);
       }
     }
   };
+  finder(0, 0);
+  finder(0, dimension - 7);
+  finder(dimension - 7, 0);
 
-  drawFinder(0, 0);
-  drawFinder(0, dimension - 7);
-  drawFinder(dimension - 7, 0);
-
-  // 2. Alignment pattern for Version 2+
+  // Alignment (V2+)
   if (version >= 2) {
-    int alignCenter = dimension - 7;
-    for (int r = -2; r <= 2; r++) {
-      for (int c = -2; c <= 2; c++) {
-        bool black = (abs(r) == 2 || abs(c) == 2 || (r == 0 && c == 0));
-        setModule(alignCenter + r, alignCenter + c, black, true);
-      }
-    }
+    int ac = dimension - 7;
+    for (int r = -2; r <= 2; ++r)
+      for (int c = -2; c <= 2; ++c)
+        set(ac + r, ac + c, (abs(r) == 2 || abs(c) == 2 || (r == 0 && c == 0)), true);
   }
 
-  // 3. Timing patterns
-  for (int i = 8; i < dimension - 8; i++) {
-    setModule(6, i, (i % 2 == 0), true);
-    setModule(i, 6, (i % 2 == 0), true);
+  // Timing
+  for (int i = 8; i < dimension - 8; ++i) {
+    set(6, i, (i & 1) == 0, true);
+    set(i, 6, (i & 1) == 0, true);
   }
 
-  // 4. Dark module
-  setModule(4 * version + 9, 8, true, true);
+  // Dark module
+  set(4 * version + 9, 8, true, true);
 
-  // 5. Reserve format info areas
-  for (int i = 0; i < 9; i++) {
-    if (i != 6) { setModule(8, i, false, true); setModule(i, 8, false, true); }
+  // Format info alanlarını rezerve et
+  for (int i = 0; i < 9; ++i) {
+    if (i != 6) { set(8, i, false, true); set(i, 8, false, true); }
   }
-  for (int i = 0; i < 8; i++) {
-    setModule(8, dimension - 1 - i, false, true);
-    setModule(dimension - 1 - i, 8, false, true);
+  for (int i = 0; i < 8; ++i) {
+    set(8, dimension - 1 - i, false, true);
+    set(dimension - 1 - i, 8, false, true);
   }
 
-  // 6. Place Data and ECC Codewords (Zig-Zag column traversal)
+  // ----------------------------------------------------------
+  // 5. Data yerleştirme (doğru zigzag)
+  // ----------------------------------------------------------
   int bitIdx = 0;
-  int totalBits = finalCodewords.size() * 8;
+  const int totalBits = (int)codewords.size() * 8;
 
-  int col = dimension - 1;
-  while (col > 0) {
-    if (col == 6) col--; // Skip timing column
+  for (int col = dimension - 1; col > 0; col -= 2) {
+    if (col == 6) col--;                         // timing kolonunu atla
 
-    for (int rowDir = 0; rowDir < dimension; rowDir++) {
-      for (int cOffset = 0; cOffset < 2; cOffset++) {
-        int curC = col - cOffset;
-        int curR = ((col + 1) / 2 % 2 == 1) ? (dimension - 1 - rowDir) : rowDir;
+    // Yön: çift çift kolonlarda yukarı, teklerde aşağı
+    // col=dimension-1 (sağ kenar) → yukarı git
+    bool upward = ((dimension - 1 - col) / 2) % 2 == 0;
 
-        int gr = curR + quietZone;
-        int gc = curC + quietZone;
+    for (int i = 0; i < dimension; ++i) {
+      int row = upward ? (dimension - 1 - i) : i;
 
-        if (isReserved[gr * totalDim + gc] == 0) {
-          bool bit = false;
-          if (bitIdx < totalBits) {
-            int byteIndex = bitIdx / 8;
-            int bitPos = 7 - (bitIdx % 8);
-            bit = (finalCodewords[byteIndex] & (1 << bitPos)) != 0;
-            bitIdx++;
-          }
-          // Mask 0: (r + c) % 2 == 0
-          if ((curR + curC) % 2 == 0) bit = !bit;
-          setModule(curR, curC, bit, false);
+      for (int dc = 0; dc < 2; ++dc) {
+        int c = col - dc;
+        int gr = row + quiet, gc = c + quiet;
+
+        if (reserved[gr * size + gc]) continue;
+
+        bool bit = false;
+        if (bitIdx < totalBits) {
+          int bi = bitIdx >> 3;
+          int bp = 7 - (bitIdx & 7);
+          bit = (codewords[bi] & (1 << bp)) != 0;
+          ++bitIdx;
         }
+
+        // Mask 0
+        if (((row + c) & 1) == 0) bit = !bit;
+
+        set(row, c, bit, false);
       }
     }
-    col -= 2;
   }
 
-  // 7. Format Information (BCH 15,5 bit code with Mask 0 & Level M 0x5412 XOR)
-  uint16_t formatBits = 0x5412; // Standard Format bits for Mask 0, ECC Level M
-  for (int i = 0; i < 15; i++) {
-    bool bit = (formatBits & (1 << i)) != 0;
-    if (i < 6) setModule(8, i, bit, true);
-    else if (i < 8) setModule(8, i + 1, bit, true);
-    else if (i == 8) setModule(7, 8, bit, true);
-    else setModule(14 - i, 8, bit, true);
+  // ----------------------------------------------------------
+  // 6. Format Information (Mask 0 + Level M = 0x5412)
+  // Tek sefer, doğru pozisyonlar
+  // ----------------------------------------------------------
+  const uint16_t format = 0x5412;   // Level M (01) + Mask 0 (000) after BCH + mask
 
-    if (i < 7) setModule(dimension - 1 - i, 8, bit, true);
-    else setModule(8, dimension - 15 + i, bit, true);
-  }
+  // Sol-üst dikey + yatay
+  for (int i = 0; i < 6; ++i) set(i, 8, (format >> i) & 1, true);
+  set(7, 8, (format >> 6) & 1, true);
+  set(8, 8, (format >> 7) & 1, true);
+  set(8, 7, (format >> 8) & 1, true);
+  for (int i = 9; i < 15; ++i) set(8, 14 - i, (format >> i) & 1, true);
 
-  outDimension = totalDim;
+  // Sağ-üst kopya (yatay)
+  for (int i = 0; i < 8; ++i)
+    set(8, dimension - 1 - i, (format >> i) & 1, true);
+
+  // Sol-alt kopya (dikey)
+  for (int i = 0; i < 7; ++i)
+    set(dimension - 1 - i, 8, (format >> (i + 8)) & 1, true);
+
+  outDimension = size;
   return true;
 }
 
